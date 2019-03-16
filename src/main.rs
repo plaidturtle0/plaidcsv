@@ -4,10 +4,10 @@ extern crate regex;
 extern crate approx;
 use std::error;
 use std::error::Error;
-use std::fs::File;
 use std::fmt;
 use std::collections::HashMap;
 use std::process::exit;
+use std::io;
 use clap::{Arg, App};
 use sqlparser::dialect::GenericSqlDialect;
 use sqlparser::sqlparser::Parser;
@@ -147,15 +147,15 @@ fn write_view<T>(view: &mut GenericView, writer: &mut Writer<T>) -> Result<(),Bo
   }
   loop {
     if let Some(row) = view.next()? {
-      writer.write_record(&format_row(&row));
+      writer.write_record(&format_row(&row))?;
     } else {
       return Ok(())
     }
   }
 }
 
-struct FileView {
-  rdr:Reader<File>,
+struct FileView<T> {
+  rdr:Reader<T>,
   meta:ViewMetadata
 }
 
@@ -169,13 +169,30 @@ fn make_lookup( hdr : &Option<StringRecord> ) -> HashMap<String,usize> {
   map
 }
 
-fn make_file_view( path : &str, opts : &CSVOptions ) -> Result<Box<GenericView>, Box<Error>> {
-  let mut reader = ReaderBuilder::new()
+fn make_stdin_view(available: &mut bool, opts: &CSVOptions) -> Result<Box<GenericView>, Box<Error>> {
+  if *available {
+    *available=false;
+  } else {
+    return Err(make_sql_err(None, "You can only read from stdin once"))
+  }
+  let reader = ReaderBuilder::new()
     .delimiter(opts.delimiter)
-    .has_headers(opts.headers)
-    .from_path(path)?;
+    .has_headers(false)
+    .from_reader(io::stdin());
+  make_reader_view(reader, opts)
+}
 
-  let hdrs = if opts.headers { Some(reader.headers().unwrap().clone()) } else { None };
+fn make_file_view(path : &str, opts : &CSVOptions) -> Result<Box<GenericView>, Box<Error>> {
+  let reader = ReaderBuilder::new()
+    .delimiter(opts.delimiter)
+    .has_headers(false)
+    .from_path(path)?;
+  make_reader_view(reader, opts)
+}
+
+fn make_reader_view<T>(mut reader: csv::Reader<T>, opts : &CSVOptions) -> Result<Box<GenericView>, Box<Error>>
+  where T: std::io::Read, T: 'static {
+  let hdrs = if opts.headers { Some(reader.records().next().unwrap().unwrap().clone()) } else { None };
   Ok(Box::new(FileView{
     meta : ViewMetadata {
       line: 0,
@@ -186,7 +203,8 @@ fn make_file_view( path : &str, opts : &CSVOptions ) -> Result<Box<GenericView>,
   }))
 }
 
-impl GenericView for FileView {
+impl<T> GenericView for FileView<T>
+  where T: std::io::Read {
   fn next(&mut self) -> Result<Option<TableRow>,Box<Error>> {
     match self.rdr.records().next() {
       Some(result) => {
@@ -321,7 +339,7 @@ impl AggregateFn for AvgFn {
   fn output(&self) -> Result<CSVCell, Box<Error>> {
     match &self.count {
       0 => Err(make_sql_err(None, &format!("Can't take AVG of no values"))),
-      x => Ok(VFlt(self.sum/(self.count as f64)))
+      _ => Ok(VFlt(self.sum/(self.count as f64)))
     }
   }
 }
@@ -383,7 +401,7 @@ fn make_sql_err( node : Option<&ASTNode>, msg : &str ) -> Box<SqlError> {
   })
 }
 
-fn make_sql_view( node : ASTNode, srcs : &HashMap<String,String>, opts : &CSVOptions ) -> Result<Box<GenericView>, Box<Error>> {
+fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions, stdin_available: &mut bool) -> Result<Box<GenericView>, Box<Error>> {
   match node {
     SQLIdentifier(ref table) => {
       match srcs.get::<str>( &table ) {
@@ -392,62 +410,61 @@ fn make_sql_view( node : ASTNode, srcs : &HashMap<String,String>, opts : &CSVOpt
       }
     },
     SQLSelect{ projection, relation, joins:_, selection, order_by, group_by:_, having:_, limit } => {
-      if let Some(source) = relation {
-        let mut src = make_sql_view(*source, srcs, opts)?;
-        let headers;
-        match projection.as_slice() {
-          [] => return Err(make_sql_err(None, "Must specify at least one field to select")),
-          [SQLWildcard] => {
-            headers = src.headers().clone();
-          },
-          _ => {
-            let mut hdr = StringRecord::new();
-            for (i, proj) in projection.iter().enumerate() {
-              if let SQLIdentifier(id) = proj {
-                hdr.push_field(id);
-              } else {
-                hdr.push_field(&format!("Field{}", i));
-              }
+      let mut src = match relation {
+        Some(source) => make_sql_view(*source, srcs, opts, stdin_available)?,
+        None => make_stdin_view(stdin_available, opts)?
+      };
+      let headers;
+      match projection.as_slice() {
+        [] => return Err(make_sql_err(None, "Must specify at least one field to select")),
+        [SQLWildcard] => {
+          headers = src.headers().clone();
+        },
+        _ => {
+          let mut hdr = StringRecord::new();
+          for (i, proj) in projection.iter().enumerate() {
+            if let SQLIdentifier(id) = proj {
+              hdr.push_field(id);
+            } else {
+              hdr.push_field(&format!("Field{}", i));
             }
-            headers = Some(hdr);
           }
-        };
-        let lim = match limit {
-          None => None,
-          Some(limnode) => match eval_node(&limnode, None, None)? {
-            VInt(i) => Some(i),
-            _ => return Err(make_sql_err(Some(&limnode),"LIMIT must evaluate to int"))
-          }
-        };
-        let (aggregate, proj) = is_aggregate(projection);
-        let sel = Box::new(SelectView{
-          projection: proj,
-          relation: src,
-          selection: selection,
-          order_by: order_by,
-          limit: lim,
-          meta: ViewMetadata {
-            line: 0,
-            header_lookup: make_lookup(&headers),
-            headers: headers.clone()
-          }
-        });
-        match aggregate {
-          None => Ok(sel),
-          Some(fns) => {
-            Ok(Box::new(AggregateView{
-              fns: fns,
-              source: sel,
-              meta: ViewMetadata {
-                line: 0,
-                header_lookup: make_lookup(&headers),
-                headers: headers
-              }
-            }))
-          }
+          headers = Some(hdr);
         }
-      } else {
-        return Err(make_sql_err(None, "Must specify at least one source table in FROM"));
+      };
+      let lim = match limit {
+        None => None,
+        Some(limnode) => match eval_node(&limnode, None, None)? {
+          VInt(i) => Some(i),
+          _ => return Err(make_sql_err(Some(&limnode),"LIMIT must evaluate to int"))
+        }
+      };
+      let (aggregate, proj) = is_aggregate(projection);
+      let sel = Box::new(SelectView{
+        projection: proj,
+        relation: src,
+        selection: selection,
+        order_by: order_by,
+        limit: lim,
+        meta: ViewMetadata {
+          line: 0,
+          header_lookup: make_lookup(&headers),
+          headers: headers.clone()
+        }
+      });
+      match aggregate {
+        None => Ok(sel),
+        Some(fns) => {
+          Ok(Box::new(AggregateView{
+            fns: fns,
+            source: sel,
+            meta: ViewMetadata {
+              line: 0,
+              header_lookup: make_lookup(&headers),
+              headers: headers
+            }
+          }))
+        }
       }
     }
     _ => Err(Box::new(NotImplError))
@@ -697,6 +714,9 @@ impl GenericView for AggregateView {
 
     while let Some(src_row) = self.source.next()? {
       for (i, val) in src_row.data.iter().enumerate() {
+        if i >= self.fns.len() {
+          break;
+        }
         self.fns[i].accumulate(val)?;
       }
     }
@@ -765,7 +785,7 @@ fn do_main() -> Result<(), Box<Error>>{
     let matches =
       App::new("plaidcsv")
          .version("0.1.0")
-         .about("Does great things!")
+         .about("Execute SQL statements on CSV files")
          .author("Plaid Turtle 0")
          .arg(Arg::with_name("query")
               .required(true)
@@ -806,16 +826,10 @@ fn do_main() -> Result<(), Box<Error>>{
       }
     }
 
-    /*let mut file_views : Vec<FileView> = Vec::new();
-    if let Some(table_iter) = tables {
-      for table in table_iter {
-        file_views.push(make_file_view(table, &opts).graceful_unwrap(
-          &format!("An error occured opening the csv file {}", &table)));
-      }
-    }*/
     eprintln!("Opts: {:?}", opts);
     eprintln!("Tables: {:?}", &table_lookup);
-    let mut sql_view = make_sql_view( ast, &table_lookup, &opts )?;
+    let mut stdin_available = true;
+    let mut sql_view = make_sql_view( ast, &table_lookup, &opts, &mut stdin_available )?;
     let mut wtr = WriterBuilder::new()
       .delimiter(opts.delimiter)
       .has_headers(false)
