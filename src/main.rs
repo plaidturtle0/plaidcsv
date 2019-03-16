@@ -358,6 +358,7 @@ fn get_aggregate_fn(id:&str) -> Option<Box<AggregateFn>> {
 struct AggregateView {
   fns: Vec<Box<AggregateFn>>,
   source: Box<GenericView>,
+  limit: Option<i64>,
   meta: ViewMetadata
 }
 
@@ -440,12 +441,12 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
         }
       };
       let (aggregate, proj) = is_aggregate(projection);
-      let sel = Box::new(SelectView{
+      let mut sel = Box::new(SelectView{
         projection: proj,
         relation: src,
         selection: selection,
         order_by: order_by,
-        limit: lim,
+        limit: lim.clone(),
         meta: ViewMetadata {
           line: 0,
           header_lookup: make_lookup(&headers),
@@ -455,9 +456,11 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
       match aggregate {
         None => Ok(sel),
         Some(fns) => {
+          sel.limit = None;
           Ok(Box::new(AggregateView{
             fns: fns,
             source: sel,
+            limit: lim,
             meta: ViewMetadata {
               line: 0,
               header_lookup: make_lookup(&headers),
@@ -594,13 +597,26 @@ fn function_type(id:&str) -> FnType {
   }
 }
 
-fn eval_sql_function(id:&str, args:&[CSVCell], src: Option<&GenericView>) -> Result<CSVCell,Box<Error>> {
+fn eval_sql_function(id:&str, args:&[CSVCell], row: Option<&TableRow>, src: Option<&GenericView>) -> Result<CSVCell,Box<Error>> {
   match (id.to_uppercase().as_ref(), args) {
-    ("LINE", []) => match src {
+    ("LINE", []) =>
+      match src {
         Some(src) => Ok(VInt(src.linenum())),
         None => Err(make_sql_err(None, "LINE() requires a context"))
-      }
+      },
     ("LINE", _) => Err(make_sql_err(None, "LINE() takes no args")),
+    ("COL", [VInt(idx)]) =>
+      match row {
+        Some(row) => Ok(
+          if *idx >= 0 && (*idx as usize) < row.data.len() {
+            row.data[*idx as usize].clone()
+          } else {
+            VEmp
+          }
+        ),
+        None => Err(make_sql_err(None, "COL() requires a context"))
+      },
+    ("COL", _) => Err(make_sql_err(None, "COL() takes 1 arg which must be an int")),
     (x, _) =>
       match get_aggregate_fn(x) {
         Some(mut agg) => {
@@ -623,9 +639,7 @@ fn eval_node(node: &ASTNode, row: Option<&TableRow>, src: Option<&GenericView>) 
       },
     SQLValue(Value::Long(i)) => Ok(VInt(*i)),
     SQLValue(Value::Double(f)) => Ok(VFlt(*f)),
-    SQLValue(Value::String(s)) => Ok(VStr(s.to_string())),
     SQLValue(Value::SingleQuotedString(s)) => Ok(VStr(s.to_string())),
-    SQLValue(Value::DoubleQuotedString(s)) => Ok(VStr(s.to_string())),
     SQLValue(Value::Null) => Ok(VEmp),
     SQLValue(Value::Boolean(b)) => Ok(VBool(*b)),
     SQLValue(_) => Err(make_sql_err(Some(node), "Not a supported datatype")),
@@ -640,7 +654,7 @@ fn eval_node(node: &ASTNode, row: Option<&TableRow>, src: Option<&GenericView>) 
     },
     SQLFunction{id, args} => {
       let args:Result<Vec<CSVCell>,_> = args.into_iter().map(|x| eval_node(x, row, src)).collect();
-      eval_sql_function(id, args?.as_slice(), src)
+      eval_sql_function(id, args?.as_slice(), row, src)
     },
     _ => Err(Box::new(NotImplError))
   }
@@ -673,12 +687,13 @@ impl GenericView for SelectView {
     match next_where(&mut *self.relation, &self.selection)? {
       None => Ok(None),
       Some(src_row) => {
-        self.meta.line += 1;
         if let Some(lim) = self.limit {
-          if self.meta.line > lim {
+          if self.meta.line >= lim {
             return Ok(None)
           }
         }
+
+        self.meta.line += 1;
         match self.projection.as_slice() {
           [SQLWildcard] => Ok(Some(src_row)),
           _ => {
@@ -709,6 +724,11 @@ impl GenericView for AggregateView {
   fn next(&mut self) -> Result<Option<TableRow>,Box<Error>> {
     if self.meta.line > 0 {
       return Ok(None);
+    }
+    if let Some(lim) = self.limit {
+      if self.meta.line >= lim {
+        return Ok(None)
+      }
     }
     self.meta.line += 1;
 
