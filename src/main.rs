@@ -230,7 +230,6 @@ struct SelectView {
   relation: Box<GenericView>,
   selection: Option<Box<ASTNode>>,
   order_by: Option<Vec<SQLOrderByExpr>>,
-  limit: Option<i64>,
   // omitted: joins, group_by, having
   meta: ViewMetadata
 }
@@ -358,7 +357,12 @@ fn get_aggregate_fn(id:&str) -> Option<Box<AggregateFn>> {
 struct AggregateView {
   fns: Vec<Box<AggregateFn>>,
   source: Box<GenericView>,
-  limit: Option<i64>,
+  meta: ViewMetadata
+}
+
+struct LimitView {
+  limit: i64,
+  source: Box<GenericView>,
   meta: ViewMetadata
 }
 
@@ -441,34 +445,46 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
         }
       };
       let (aggregate, proj) = is_aggregate(projection);
-      let mut sel = Box::new(SelectView{
+      let sel: Box<GenericView> = Box::new(SelectView{
         projection: proj,
         relation: src,
         selection: selection,
         order_by: order_by,
-        limit: lim.clone(),
         meta: ViewMetadata {
           line: 0,
           header_lookup: make_lookup(&headers),
           headers: headers.clone()
         }
       });
-      match aggregate {
-        None => Ok(sel),
+      let maybe_agg = match aggregate {
+        None => sel,
         Some(fns) => {
-          sel.limit = None;
-          Ok(Box::new(AggregateView{
+          Box::new(AggregateView{
             fns: fns,
             source: sel,
-            limit: lim,
+            meta: ViewMetadata {
+              line: 0,
+              header_lookup: make_lookup(&headers),
+              headers: headers.clone()
+            }
+          })
+        }
+      };
+      let maybe_lim = match lim {
+        Some(i) => {
+          Box::new(LimitView{
+            limit: i,
+            source: maybe_agg,
             meta: ViewMetadata {
               line: 0,
               header_lookup: make_lookup(&headers),
               headers: headers
             }
-          }))
-        }
-      }
+          })
+        },
+        None => maybe_agg
+      };
+      Ok(maybe_lim)
     }
     _ => Err(Box::new(NotImplError))
   }
@@ -687,12 +703,6 @@ impl GenericView for SelectView {
     match next_where(&mut *self.relation, &self.selection)? {
       None => Ok(None),
       Some(src_row) => {
-        if let Some(lim) = self.limit {
-          if self.meta.line >= lim {
-            return Ok(None)
-          }
-        }
-
         self.meta.line += 1;
         match self.projection.as_slice() {
           [SQLWildcard] => Ok(Some(src_row)),
@@ -725,11 +735,6 @@ impl GenericView for AggregateView {
     if self.meta.line > 0 {
       return Ok(None);
     }
-    if let Some(lim) = self.limit {
-      if self.meta.line >= lim {
-        return Ok(None)
-      }
-    }
     self.meta.line += 1;
 
     while let Some(src_row) = self.source.next()? {
@@ -747,6 +752,25 @@ impl GenericView for AggregateView {
       row.data.push(fun.output()?);
     }
     Ok(Some(row))
+  }
+  fn headers(&mut self) -> &Option<StringRecord> {
+    return &self.meta.headers;
+  }
+  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
+    field_lookup(&self.meta, row, field)
+  }
+  fn linenum(&self) -> i64 {
+    return self.meta.line;
+  }
+}
+
+impl GenericView for LimitView {
+  fn next(&mut self) -> Result<Option<TableRow>,Box<Error>> {
+    self.meta.line += 1;
+    if self.meta.line > self.limit {
+      return Ok(None)
+    }
+    return self.source.next()
   }
   fn headers(&mut self) -> &Option<StringRecord> {
     return &self.meta.headers;
