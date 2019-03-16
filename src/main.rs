@@ -8,6 +8,7 @@ use std::fmt;
 use std::collections::HashMap;
 use std::process::exit;
 use std::io;
+use std::cmp::Ordering;
 use clap::{Arg, App};
 use sqlparser::dialect::GenericSqlDialect;
 use sqlparser::sqlparser::Parser;
@@ -145,13 +146,10 @@ fn write_view<T>(view: &mut GenericView, writer: &mut Writer<T>) -> Result<(),Bo
   if let Some(hdr) = view.headers() {
     writer.write_record(hdr)?
   }
-  loop {
-    if let Some(row) = view.next()? {
-      writer.write_record(&format_row(&row))?;
-    } else {
-      return Ok(())
-    }
+  while let Some(row) = view.next()? {
+    writer.write_record(&format_row(&row))?;
   }
+  return Ok(())
 }
 
 struct FileView<T> {
@@ -229,8 +227,26 @@ struct SelectView {
   projection: Vec<ASTNode>,
   relation: Box<GenericView>,
   selection: Option<Box<ASTNode>>,
-  order_by: Option<Vec<SQLOrderByExpr>>,
   // omitted: joins, group_by, having
+  meta: ViewMetadata
+}
+
+struct AggregateView {
+  fns: Vec<Box<AggregateFn>>,
+  source: Box<GenericView>,
+  meta: ViewMetadata
+}
+
+struct LimitView {
+  limit: i64,
+  source: Box<GenericView>,
+  meta: ViewMetadata
+}
+
+struct SortedView {
+  cache: Option<Vec<TableRow>>,
+  order_by: Vec<SQLOrderByExpr>,
+  source: Box<GenericView>,
   meta: ViewMetadata
 }
 
@@ -354,18 +370,6 @@ fn get_aggregate_fn(id:&str) -> Option<Box<AggregateFn>> {
   }
 }
 
-struct AggregateView {
-  fns: Vec<Box<AggregateFn>>,
-  source: Box<GenericView>,
-  meta: ViewMetadata
-}
-
-struct LimitView {
-  limit: i64,
-  source: Box<GenericView>,
-  meta: ViewMetadata
-}
-
 fn is_aggregate( proj: Vec<ASTNode> ) -> (Option<Vec<Box<AggregateFn>>>, Vec<ASTNode>) {
   let mut aggregate = true;
   for node in proj.iter() {
@@ -445,23 +449,38 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
         }
       };
       let (aggregate, proj) = is_aggregate(projection);
-      let sel: Box<GenericView> = Box::new(SelectView{
+      let view = match order_by {
+        None => src,
+        Some(order_expr) => {
+          let hdr = src.headers().clone();
+          Box::new(SortedView{
+            cache: None,
+            order_by: order_expr,
+            source: src,
+            meta: ViewMetadata {
+              line: 0,
+              header_lookup: make_lookup(&hdr),
+              headers: hdr
+            }
+          })
+        }
+      };
+      let view: Box<GenericView> = Box::new(SelectView{
         projection: proj,
-        relation: src,
+        relation: view,
         selection: selection,
-        order_by: order_by,
         meta: ViewMetadata {
           line: 0,
           header_lookup: make_lookup(&headers),
           headers: headers.clone()
         }
       });
-      let maybe_agg = match aggregate {
-        None => sel,
+      let view = match aggregate {
+        None => view,
         Some(fns) => {
           Box::new(AggregateView{
             fns: fns,
-            source: sel,
+            source: view,
             meta: ViewMetadata {
               line: 0,
               header_lookup: make_lookup(&headers),
@@ -470,31 +489,62 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
           })
         }
       };
-      let maybe_lim = match lim {
+      let view = match lim {
+        None => view,
         Some(i) => {
           Box::new(LimitView{
             limit: i,
-            source: maybe_agg,
+            source: view,
             meta: ViewMetadata {
               line: 0,
               header_lookup: make_lookup(&headers),
               headers: headers
             }
           })
-        },
-        None => maybe_agg
+        }
       };
-      Ok(maybe_lim)
+      Ok(view)
     }
     _ => Err(Box::new(NotImplError))
   }
 }
 
-fn eval_cmp_op(l:&CSVCell, r:&CSVCell, lt:bool, eq:bool, gt:bool) -> Result<CSVCell,Box<Error>>{
+fn compare_cells(l:&CSVCell, r:&CSVCell) -> Ordering {
+  // If types are comparable, sort by natural order
+  if let Ok(VBool(true)) = eval_cmp_op(l, r, false, true, false) {
+    return Ordering::Equal;
+  };
+  if let Ok(VBool(true)) = eval_cmp_op(l, r, true, false, false) {
+    return Ordering::Less;
+  };
+  if let Ok(VBool(true)) = eval_cmp_op(l, r, false, false, true) {
+    return Ordering::Greater;
+  };
+  // Otherwise, sort by type (arbitrary but at least consistent).
+  // We can't throw errors inside sort unfortunately.
+  // Note: We know they are not the same type, otherwise they would have been comparable.
+  match (l,r) {
+    (VInt(_), _) => Ordering::Less,
+    (_, VInt(_)) => Ordering::Greater,
+    (VFlt(_), _) => Ordering::Less,
+    (_,VFlt(_)) => Ordering::Greater,
+    (VStr(_),_) => Ordering::Less,
+    (_,VStr(_)) => Ordering::Greater,
+    (VBool(_),_) => Ordering::Less,
+    (_,VBool(_)) => Ordering::Greater,
+    (VEmp,_) => Ordering::Less,
+  }
+}
+
+fn eval_cmp_op(l:&CSVCell, r:&CSVCell, lt:bool, eq:bool, gt:bool) -> Result<CSVCell,Box<Error>> {
   match (l,r) {
     (VStr(l), VStr(r)) => Ok(VBool((lt && l<r) ||
                                    (eq && l==r) ||
                                    (gt && l>r))),
+    (VBool(l), VBool(r)) => Ok(VBool((lt && l<r) ||
+                                     (eq && l==r) ||
+                                     (gt && l>r))),
+    (VEmp, VEmp) => Ok(VBool(eq)),
     (VInt(l), VInt(r)) => Ok(VBool((lt && l<r) ||
                                    (eq && l==r) ||
                                    (gt && l>r))),
@@ -766,11 +816,77 @@ impl GenericView for AggregateView {
 
 impl GenericView for LimitView {
   fn next(&mut self) -> Result<Option<TableRow>,Box<Error>> {
-    self.meta.line += 1;
-    if self.meta.line > self.limit {
-      return Ok(None)
+    if self.meta.line >= self.limit {
+      Ok(None)
+    } else {
+      self.meta.line += 1;
+      self.source.next()
     }
-    return self.source.next()
+  }
+  fn headers(&mut self) -> &Option<StringRecord> {
+    return &self.meta.headers;
+  }
+  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
+    field_lookup(&self.meta, row, field)
+  }
+  fn linenum(&self) -> i64 {
+    return self.meta.line;
+  }
+}
+
+impl GenericView for SortedView {
+  fn next(&mut self) -> Result<Option<TableRow>,Box<Error>> {
+    if let None = self.cache {
+      let mut vec = Vec::new();
+      while let Some(row) = self.source.next()? {
+        vec.push(row);
+      }
+      // Since we'll be popping from the end of the list, sort in the opposite direction
+      // of what was requested
+      let mut err = Ok(());
+      vec.sort_by(|l, r| {
+        for node in self.order_by.iter() {
+          let lval = match eval_node(&node.expr, Some(l), Some(&*self.source)) {
+            Ok(lv) => lv,
+            Err(e) => {
+              // Even if an error occurred, we must continue on,
+              // but we'll throw it later
+              err=Err(e);
+              VEmp
+            }
+          };
+          let rval = match eval_node(&node.expr, Some(r), Some(&*self.source)) {
+            Ok(rv) => rv,
+            Err(e) => {
+              err=Err(e);
+              VEmp
+            }
+          };
+          let ord = compare_cells(&lval, &rval);
+          if ord != Ordering::Equal {
+            if node.asc {
+              return ord;
+            } else {
+              return ord.reverse();
+            }
+          }
+        }
+        Ordering::Equal
+      });
+      err?;
+      vec.reverse();
+      self.cache = Some(vec);
+    };
+    if let Some(ref mut rows) = self.cache {
+      if let Some(row) = rows.pop() {
+        self.meta.line += 1;
+        Ok(Some(row))
+      } else {
+        Ok(None)
+      }
+    } else {
+      panic!("Not possible");
+    }
   }
   fn headers(&mut self) -> &Option<StringRecord> {
     return &self.meta.headers;
