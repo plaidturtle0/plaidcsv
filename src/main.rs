@@ -12,14 +12,16 @@ use std::cmp::Ordering;
 use clap::{Arg, App};
 use sqlparser::dialect::GenericSqlDialect;
 use sqlparser::sqlparser::Parser;
-use sqlparser::sqlast::{ASTNode,SQLOrderByExpr,Value,SQLOperator,SQLStatement,SQLSetExpr,TableFactor, SQLObjectName,SQLQuery,SQLSelectItem};
-use sqlparser::sqlast::ASTNode::{SQLIdentifier,SQLValue,SQLBinaryExpr,SQLUnary,SQLFunction};
+use sqlparser::sqlast::{ASTNode,Value,SQLOperator,SQLStatement,SQLSetExpr,TableFactor, SQLObjectName,SQLQuery,SQLSelectItem,SQLType,SQLOrderByExpr};
+use sqlparser::sqlast::ASTNode::*;
 use sqlparser::sqlast::SQLSelectItem::{UnnamedExpression,ExpressionWithAlias,QualifiedWildcard,Wildcard};
 use csv::{Reader,ReaderBuilder,Writer,WriterBuilder,StringRecord};
 use regex::Regex;
 use approx::abs_diff_eq;
 
-use crate::CSVCell::{VFlt,VInt,VStr,VEmp,VBool};
+use crate::CSVCell::{VFlt,VInt,VStr,VEmp,VBool,VRegex};
+use crate::OptNode::*;
+use crate::OptSelectItem::*;
 
 #[derive(Debug, Clone)]
 struct NotImplError;
@@ -85,6 +87,7 @@ enum CSVCell {
   VFlt(f64),
   VStr(String),
   VBool(bool),
+  VRegex(Regex),
   VEmp
 }
 
@@ -95,6 +98,70 @@ enum FnType {
 
 struct TableRow {
   data: Vec<CSVCell>
+}
+
+enum OptSelectItem {
+  OptUnnamedExpression(OptNode),
+  OptExpressionWithAlias(OptNode, String),
+  OptSQualifiedWildcard(SQLObjectName),
+  OptSWildcard,
+}
+
+struct OptOrderByExpr {
+  expr: OptNode,
+  asc: Option<bool>
+}
+
+#[derive(Debug)]
+enum OptNode {
+  OptField(usize),
+  OptWildcard,
+  OptQualifiedWildcard(Vec<String>),
+  OptCompoundIdentifier(Vec<String>),
+  OptIsNull(Box<OptNode>),
+  OptIsNotNull(Box<OptNode>),
+  OptInList {
+    expr: Box<OptNode>,
+    list: Vec<OptNode>,
+    negated: bool,
+  },
+  OptInSubquery {
+    expr: Box<OptNode>,
+    subquery: Box<SQLQuery>,
+    negated: bool,
+  },
+  OptBetween {
+    expr: Box<OptNode>,
+    negated: bool,
+    low: Box<OptNode>,
+    high: Box<OptNode>,
+  },
+  OptBinaryExpr {
+    left: Box<OptNode>,
+    op: SQLOperator,
+    right: Box<OptNode>,
+  },
+  OptCast {
+    expr: Box<OptNode>,
+    data_type: SQLType,
+  },
+  OptNested(Box<OptNode>),
+  OptUnary {
+    operator: SQLOperator,
+    expr: Box<OptNode>,
+  },
+  OptValue(CSVCell),
+  OptRegex(Regex),
+  OptFunction {
+    id: String,
+    args: Vec<OptNode>,
+  },
+  OptCase {
+    conditions: Vec<OptNode>,
+    results: Vec<OptNode>,
+    else_result: Option<Box<OptNode>>,
+  },
+  OptSubquery(Box<SQLQuery>),
 }
 
 fn parse_field( field: &str ) -> CSVCell {
@@ -113,6 +180,7 @@ fn format_field( field: &CSVCell ) -> String {
     VFlt(i) => i.to_string(),
     VStr(i) => i.to_string(),
     VBool(i) => (*i as i32).to_string(),
+    VRegex(r) => r.to_string(),
     VEmp => "{missing column}".to_string()
   }
 }
@@ -152,12 +220,26 @@ fn field_lookup(meta: &ViewMetadata, row: &TableRow, field: &str) -> CSVCell {
     Some(i) => row.data.get(*i).unwrap_or(&VEmp).clone()
   }
 }
+fn field_lookup_int(row: &TableRow, field: usize) -> CSVCell {
+  row.data.get(field).unwrap_or(&VEmp).clone()
+}
 
 trait GenericView {
-  fn headers(&mut self) -> &Option<StringRecord>;
+  fn headers(&self) -> &Option<StringRecord> {
+    return &self.get_meta().headers;
+  }
+  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
+    field_lookup(&self.get_meta(), row, field)
+  }
+  fn field_to_int(&self, field: &str) -> Option<&usize> {
+    self.get_meta().header_lookup.get(field)
+  }
+  fn linenum(&self) -> i64 {
+    self.get_meta().line
+  }
+
   fn next(&mut self) -> Result<Option<TableRow>,Box<Error>>;
-  fn field(&self, row: &TableRow, field: &str) -> CSVCell;
-  fn linenum(&self) -> i64;
+  fn get_meta(&self) -> &ViewMetadata;
 }
 
 fn write_view<T>(view: &mut GenericView, writer: &mut Writer<T>) -> Result<(),Box<Error>>
@@ -231,21 +313,15 @@ impl<T> GenericView for FileView<T>
       None => Ok(None)
     }
   }
-  fn headers(&mut self) -> &Option<StringRecord> {
-    return &self.meta.headers;
-  }
-  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
-    field_lookup(&self.meta, row, field)
-  }
-  fn linenum(&self) -> i64 {
-    return self.meta.line;
+  fn get_meta(&self) -> &ViewMetadata {
+    &self.meta
   }
 }
 
 struct SelectView {
-  projection: Vec<SQLSelectItem>,
+  projection: Vec<OptSelectItem>,
   relation: Box<GenericView>,
-  selection: Option<ASTNode>,
+  selection: Option<OptNode>,
   // omitted: joins, group_by, having
   meta: ViewMetadata
 }
@@ -264,7 +340,7 @@ struct LimitView {
 
 struct SortedView {
   cache: Option<Vec<TableRow>>,
-  order_by: Vec<SQLOrderByExpr>,
+  order_by: Vec<OptOrderByExpr>,
   source: Box<GenericView>,
   meta: ViewMetadata
 }
@@ -396,6 +472,13 @@ fn get_node_from_select_item( item: &SQLSelectItem) -> Option<&ASTNode> {
     _ => None
   }
 }
+fn get_node_from_oselect_item( item: &OptSelectItem) -> Option<&OptNode> {
+  match item {
+    OptUnnamedExpression(node) => Some(node),
+    OptExpressionWithAlias(node,_) => Some(node),
+    _ => None
+  }
+}
 
 fn is_aggregate( proj: Vec<SQLSelectItem> ) -> (Option<Vec<Box<AggregateFn>>>, Vec<SQLSelectItem>) {
   let mut aggregate = true;
@@ -447,6 +530,12 @@ fn make_sql_err( node : Option<&ASTNode>, msg : &str ) -> Box<SqlError> {
   })
 }
 
+fn make_osql_err( node : Option<&OptNode>, msg : &str ) -> Box<SqlError> {
+  Box::new(SqlError{
+    err: format!("Invalid SQL: {}.\n{:?}", msg, node)
+  })
+}
+
 fn not_impl( msg : &str ) -> Box<NotImplReasonError> {
   Box::new(NotImplReasonError{
     err: format!("Not implemented: {:?}", msg)
@@ -472,7 +561,7 @@ fn make_query_view(node: SQLQuery, srcs: &HashMap<String,String>, opts: &CSVOpti
   match body {
     SQLSetExpr::Select(select) => {
       //let { projection, relation, joins:_, selection, group_by:_, having:_} = select;
-      let mut src = match select.relation {
+      let src = match select.relation {
         Some(TableFactor::Table {name, alias:_}) => make_object_view(name, srcs, opts)?,
         Some(TableFactor::Derived {subquery, alias:_}) => make_query_view(*subquery, srcs, opts, stdin_available)?,
         None => make_stdin_view(stdin_available, opts)?
@@ -499,9 +588,12 @@ fn make_query_view(node: SQLQuery, srcs: &HashMap<String,String>, opts: &CSVOpti
       };
       let lim = match limit {
         None => None,
-        Some(limnode) => match eval_node(&limnode, None, None)? {
-          VInt(i) => Some(i),
-          _ => return Err(make_sql_err(Some(&limnode),"LIMIT must evaluate to int"))
+        Some(limnode) => {
+          let opt = optimize_node(limnode, None)?;
+          match eval_opt_node(&opt, None, None)? {
+            VInt(i) => Some(i),
+            _ => return Err(make_osql_err(Some(&opt),"LIMIT must evaluate to int"))
+          }
         }
       };
       let (aggregate, proj) = is_aggregate(select.projection);
@@ -509,9 +601,10 @@ fn make_query_view(node: SQLQuery, srcs: &HashMap<String,String>, opts: &CSVOpti
         None => src,
         Some(order_expr) => {
           let hdr = src.headers().clone();
+          let opt_order:Result<Vec<OptOrderByExpr>,Box<Error>> = order_expr.into_iter().map(|node| optimize_order_by(node, Some(&*src))).collect();
           Box::new(SortedView{
             cache: None,
-            order_by: order_expr,
+            order_by: opt_order?,
             source: src,
             meta: ViewMetadata {
               line: 0,
@@ -521,10 +614,14 @@ fn make_query_view(node: SQLQuery, srcs: &HashMap<String,String>, opts: &CSVOpti
           })
         }
       };
+      let opt_proj:Result<Vec<OptSelectItem>,Box<Error>> = proj.into_iter().map(|node| optimize_select_item(node, Some(&*view))).collect();
       let view: Box<GenericView> = Box::new(SelectView{
-        projection: proj,
+        projection: opt_proj?,
+        selection: match select.selection {
+          Some(sel) => Some(optimize_node(sel, Some(&*view))?),
+          None => None
+        },
         relation: view,
-        selection: select.selection,
         meta: ViewMetadata {
           line: 0,
           header_lookup: make_lookup(&headers),
@@ -588,12 +685,21 @@ fn compare_cells(l:&CSVCell, r:&CSVCell) -> Ordering {
     (_,VStr(_)) => Ordering::Greater,
     (VBool(_),_) => Ordering::Less,
     (_,VBool(_)) => Ordering::Greater,
+    (VRegex(_),_) => Ordering::Less,
+    (_,VRegex(_)) => Ordering::Greater,
     (VEmp,_) => Ordering::Less,
   }
 }
 
 fn eval_cmp_op(l:&CSVCell, r:&CSVCell, lt:bool, eq:bool, gt:bool) -> Result<CSVCell,Box<Error>> {
   match (l,r) {
+    (VRegex(l), VRegex(r)) => {
+      let ls = l.to_string();
+      let rs = r.to_string();
+      Ok(VBool((lt && ls<rs) ||
+         (eq && ls==rs) ||
+         (gt && ls>rs)))
+    },
     (VStr(l), VStr(r)) => Ok(VBool((lt && l<r) ||
                                    (eq && l==r) ||
                                    (gt && l>r))),
@@ -684,6 +790,12 @@ fn eval_bin_op(l:&CSVCell, r:&CSVCell, op:&SQLOperator) -> Result<CSVCell,Box<Er
     (SQLOperator::LtEq, _, _) => eval_cmp_op(l,r,true,true,false),
     (SQLOperator::And, VBool(l), VBool(r)) => Ok(VBool(*l && *r)),
     (SQLOperator::Or, VBool(l), VBool(r)) => Ok(VBool(*l || *r)),
+    (SQLOperator::Like, VStr(l), VRegex(r)) =>  {
+      Ok(VBool(r.is_match(l)))
+    },
+    (SQLOperator::NotLike, VStr(l), VRegex(r)) =>  {
+      Ok(VBool(!r.is_match(l)))
+    },
     (SQLOperator::Like, VStr(l), VStr(r)) =>  {
       let re = sql_regex(r)?;
       Ok(VBool(re.is_match(l)))
@@ -752,43 +864,158 @@ fn eval_sql_function(id:&str, args:&[CSVCell], row: Option<&TableRow>, src: Opti
   }
 }
 
-fn eval_node(node: &ASTNode, row: Option<&TableRow>, src: Option<&GenericView>) -> Result<CSVCell,Box<Error>> {
+fn optimize_select_item(node: SQLSelectItem, src: Option<&GenericView>) -> Result<OptSelectItem, Box<Error>> {
   match node {
-    SQLIdentifier(id) =>
-      match(row,src) {
-        (Some(r), Some(s)) => Ok(s.field(r, id)),
-        _ => Err(make_sql_err(Some(node), "Can't use variables here"))
-      },
-    SQLValue(Value::Long(i)) => Ok(VInt(*i)),
-    SQLValue(Value::Double(f)) => Ok(VFlt(*f)),
-    SQLValue(Value::SingleQuotedString(s)) => Ok(VStr(s.to_string())),
-    SQLValue(Value::Null) => Ok(VEmp),
-    SQLValue(Value::Boolean(b)) => Ok(VBool(*b)),
-    SQLValue(_) => Err(make_sql_err(Some(node), "Not a supported datatype")),
+    UnnamedExpression(node) => Ok(OptUnnamedExpression(optimize_node(node, src)?)),
+    ExpressionWithAlias(node, alias) => Ok(OptExpressionWithAlias(optimize_node(node, src)?, alias)),
+    QualifiedWildcard(name) => Ok(OptSQualifiedWildcard(name)),
+    Wildcard => Ok(OptSWildcard)
+  }
+}
+
+fn optimize_order_by(node: SQLOrderByExpr, src: Option<&GenericView>) -> Result<OptOrderByExpr, Box<Error>> {
+  Ok(OptOrderByExpr {
+    expr: optimize_node(node.expr, src)?,
+    asc: node.asc
+  })
+}
+
+fn optimize_node(node: ASTNode, src: Option<&GenericView>) -> Result<OptNode, Box<Error>> {
+  match node {
+    SQLIdentifier(ref id) => {
+      if let Some(table) = src {
+        match table.field_to_int(&id) {
+          Some(i) => Ok(OptField(*i)),
+          None => Ok(OptValue(VEmp))
+        }
+      } else {
+        Err(make_sql_err(Some(&node), "Can't use field with no table in the context"))
+      }
+    },
+    SQLWildcard => Ok(OptWildcard),
+    SQLQualifiedWildcard(arg) => Ok(OptQualifiedWildcard(arg)),
+    SQLCompoundIdentifier(arg) => Ok(OptCompoundIdentifier(arg)),
+    SQLIsNull(node) => Ok(OptIsNull(Box::new(optimize_node(*node, src)?))),
+    SQLIsNotNull(node) => Ok(OptIsNotNull(Box::new(optimize_node(*node, src)?))),
+    SQLInList{expr, list, negated} => {
+      let list : Result<Vec<OptNode>, Box<Error>> = list.into_iter().map(|node| optimize_node(node, src)).collect();
+      Ok(OptInList {
+        expr: Box::new(optimize_node(*expr, src)?),
+        list: list?,
+        negated: negated
+      })
+    },
+    SQLInSubquery{expr, subquery, negated} => Ok(OptInSubquery {
+      expr: Box::new(optimize_node(*expr, src)?),
+      subquery: subquery,
+      negated: negated
+    }),
+    SQLBetween{expr, negated, low, high} => Ok(OptBetween {
+      expr: Box::new(optimize_node(*expr, src)?),
+      negated: negated,
+      low: Box::new(optimize_node(*low, src)?),
+      high: Box::new(optimize_node(*high, src)?),
+    }),
     SQLBinaryExpr{left, op, right} => {
-      let left = eval_node(left, row, src)?;
-      let right = eval_node(right, row, src)?;
+      match (&op, &*right) {
+        (SQLOperator::Like, SQLValue(Value::SingleQuotedString(right))) => Ok(OptBinaryExpr {
+          left: Box::new(optimize_node(*left, src)?),
+          op: SQLOperator::Like,
+          right: Box::new(OptValue(VRegex(sql_regex(&right)?)))
+        }),
+        (SQLOperator::NotLike, SQLValue(Value::SingleQuotedString(right))) => Ok(OptBinaryExpr {
+          left: Box::new(optimize_node(*left, src)?),
+          op: SQLOperator::NotLike,
+          right: Box::new(OptValue(VRegex(sql_regex(&right)?)))
+        }),
+        _ => {
+          Ok(OptBinaryExpr {
+            left: Box::new(optimize_node(*left, src)?),
+            op: op,
+            right: Box::new(optimize_node(*right, src)?)
+          })
+        }
+      }
+    },
+    SQLCast{expr, data_type} => Ok(OptCast {
+      expr: Box::new(optimize_node(*expr, src)?),
+      data_type: data_type
+    }),
+    SQLNested(expr) => optimize_node(*expr, src),
+    SQLUnary{operator, expr} => Ok(OptUnary {
+      operator: operator,
+      expr: Box::new(optimize_node(*expr, src)?),
+    }),
+    SQLValue(Value::Long(i)) => Ok(OptValue(VInt(i))),
+    SQLValue(Value::Double(f)) => Ok(OptValue(VFlt(f))),
+    SQLValue(Value::SingleQuotedString(s)) => Ok(OptValue(VStr(s.to_string()))),
+    SQLValue(Value::Null) => Ok(OptValue(VEmp)),
+    SQLValue(Value::Boolean(b)) => Ok(OptValue(VBool(b))),
+    SQLValue(_) => Err(make_sql_err(Some(&node), "Not a supported datatype")),
+    SQLFunction{id, args} => {
+      // TODO: Lookup function name in advance
+      let args : Result<Vec<OptNode>, Box<Error>> = args.into_iter().map(|node| optimize_node(node, src)).collect();
+      Ok(OptFunction {
+        id: id,
+        args: args?
+      })
+    },
+    SQLCase{conditions, results, else_result} => {
+      let conditions : Result<Vec<OptNode>, Box<Error>> = conditions.into_iter().map(|node| optimize_node(node, src)).collect();
+      let results : Result<Vec<OptNode>, Box<Error>> = results.into_iter().map(|node| optimize_node(node, src)).collect();
+      let else_result = match else_result {
+        Some(node) => Some(Box::new(optimize_node(*node, src)?)),
+        None => None
+      };
+      Ok(OptCase {
+        conditions: conditions?,
+        results: results?,
+        else_result: else_result
+      })
+    },
+    SQLSubquery(query) => Ok(OptSubquery(query))
+  }
+}
+
+/* TODO: remove
+fn eval_node(node: ASTNode, row: Option<&TableRow>, src: Option<&GenericView>) -> Result<CSVCell,Box<Error>> {
+ eval_opt_node(&optimize_node(node, src)?, row, src)
+}
+*/
+
+fn eval_opt_node(node: &OptNode, row: Option<&TableRow>, src: Option<&GenericView>) -> Result<CSVCell,Box<Error>> {
+  match node {
+    OptField(field) =>
+      match row {
+        Some(r) => Ok(field_lookup_int(r, *field)),
+        _ => Err(make_osql_err(Some(node), "No row, can't use variables here"))
+      },
+    OptBinaryExpr{left, op, right} => {
+      let left = eval_opt_node(left, row, src)?;
+      let right = eval_opt_node(right, row, src)?;
       eval_bin_op(&left, &right, &op)
     },
-    SQLUnary{operator, expr} => {
-      let expr = eval_node(expr, row, src)?;
+    OptUnary{operator, expr} => {
+      let expr = eval_opt_node(expr, row, src)?;
       eval_unary_op(&expr, &operator)
     },
-    SQLFunction{id, args} => {
-      let args:Result<Vec<CSVCell>,_> = args.into_iter().map(|x| eval_node(x, row, src)).collect();
+    OptFunction{id, args} => {
+      let args:Result<Vec<CSVCell>,_> = args.into_iter().map(|x| eval_opt_node(x, row, src)).collect();
       eval_sql_function(id, args?.as_slice(), row, src)
     },
+    OptValue(cell) => Ok(cell.clone()),
+    OptWildcard => Ok(VEmp), //TODO
     _ => Err(Box::new(not_impl("Node type not implemented")))
   }
 }
-fn next_where_internal(view: &mut GenericView, sel: &ASTNode) -> Result<Option<TableRow>,Box<Error>> {
+fn next_where_internal(view: &mut GenericView, sel: &OptNode) -> Result<Option<TableRow>,Box<Error>> {
   loop {
     match view.next()? {
       Some(row) => {
-        match eval_node(&sel, Some(&row), Some(view)) {
+        match eval_opt_node(sel, Some(&row), Some(view)) {
           Ok(VBool(true)) => return Ok(Some(row)),
           Ok(VBool(false)) => (),
-          Ok(_) => return Err(make_sql_err(Some(sel), "WHERE must be boolean expression")),
+          Ok(_) => return Err(make_osql_err(Some(sel), "WHERE must be boolean expression")),
           Err(e) => return Err(e)
         }
       },
@@ -797,7 +1024,7 @@ fn next_where_internal(view: &mut GenericView, sel: &ASTNode) -> Result<Option<T
   }
 }
 
-fn next_where(view: &mut GenericView, sel: &Option<ASTNode>) -> Result<Option<TableRow>,Box<Error>>{
+fn next_where(view: &mut GenericView, sel: &Option<OptNode>) -> Result<Option<TableRow>,Box<Error>>{
   match sel {
     Some(node) => next_where_internal(view, node),
     None => view.next()
@@ -811,12 +1038,12 @@ impl GenericView for SelectView {
       Some(src_row) => {
         self.meta.line += 1;
         match self.projection.as_slice() {
-          [Wildcard] => Ok(Some(src_row)),
+          [OptSWildcard] => Ok(Some(src_row)),
           _ => {
             let mut vec = Vec::new();
             for item in self.projection.iter() {
-              match get_node_from_select_item(item) {
-                Some(node) => vec.push(eval_node(&node, Some(&src_row), Some(&*self.relation))?),
+              match get_node_from_oselect_item(item) {
+                Some(node) => vec.push(eval_opt_node(&node, Some(&src_row), Some(&*self.relation))?),
                 None => return Err(make_sql_err(None,"Wildcard not supported in select unless it is the only expression"))
               }
             }
@@ -828,14 +1055,8 @@ impl GenericView for SelectView {
       }
     }
   }
-  fn headers(&mut self) -> &Option<StringRecord> {
-    return &self.meta.headers;
-  }
-  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
-    field_lookup(&self.meta, row, field)
-  }
-  fn linenum(&self) -> i64 {
-    return self.meta.line;
+  fn get_meta(&self) -> &ViewMetadata {
+    &self.meta
   }
 }
 
@@ -862,14 +1083,8 @@ impl GenericView for AggregateView {
     }
     Ok(Some(row))
   }
-  fn headers(&mut self) -> &Option<StringRecord> {
-    return &self.meta.headers;
-  }
-  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
-    field_lookup(&self.meta, row, field)
-  }
-  fn linenum(&self) -> i64 {
-    return self.meta.line;
+  fn get_meta(&self) -> &ViewMetadata {
+    &self.meta
   }
 }
 
@@ -882,14 +1097,8 @@ impl GenericView for LimitView {
       self.source.next()
     }
   }
-  fn headers(&mut self) -> &Option<StringRecord> {
-    return &self.meta.headers;
-  }
-  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
-    field_lookup(&self.meta, row, field)
-  }
-  fn linenum(&self) -> i64 {
-    return self.meta.line;
+  fn get_meta(&self) -> &ViewMetadata {
+    &self.meta
   }
 }
 
@@ -905,7 +1114,7 @@ impl GenericView for SortedView {
       let mut err = Ok(());
       vec.sort_by(|l, r| {
         for node in self.order_by.iter() {
-          let lval = match eval_node(&node.expr, Some(l), Some(&*self.source)) {
+          let lval = match eval_opt_node(&node.expr, Some(l), Some(&*self.source)) {
             Ok(lv) => lv,
             Err(e) => {
               // Even if an error occurred, we must continue on,
@@ -914,7 +1123,7 @@ impl GenericView for SortedView {
               VEmp
             }
           };
-          let rval = match eval_node(&node.expr, Some(r), Some(&*self.source)) {
+          let rval = match eval_opt_node(&node.expr, Some(r), Some(&*self.source)) {
             Ok(rv) => rv,
             Err(e) => {
               err=Err(e);
@@ -947,14 +1156,8 @@ impl GenericView for SortedView {
       panic!("Not possible");
     }
   }
-  fn headers(&mut self) -> &Option<StringRecord> {
-    return &self.meta.headers;
-  }
-  fn field(&self, row: &TableRow, field: &str) -> CSVCell {
-    field_lookup(&self.meta, row, field)
-  }
-  fn linenum(&self) -> i64 {
-    return self.meta.line;
+  fn get_meta(&self) -> &ViewMetadata {
+    &self.meta
   }
 }
 
