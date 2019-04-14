@@ -12,8 +12,9 @@ use std::cmp::Ordering;
 use clap::{Arg, App};
 use sqlparser::dialect::GenericSqlDialect;
 use sqlparser::sqlparser::Parser;
-use sqlparser::sqlast::{ASTNode, SQLOrderByExpr,Value,SQLOperator};
-use sqlparser::sqlast::ASTNode::{SQLSelect,SQLWildcard,SQLIdentifier,SQLValue,SQLBinaryExpr,SQLUnary,SQLFunction};
+use sqlparser::sqlast::{ASTNode,SQLOrderByExpr,Value,SQLOperator,SQLStatement,SQLSetExpr,TableFactor, SQLObjectName,SQLQuery,SQLSelectItem};
+use sqlparser::sqlast::ASTNode::{SQLIdentifier,SQLValue,SQLBinaryExpr,SQLUnary,SQLFunction};
+use sqlparser::sqlast::SQLSelectItem::{UnnamedExpression,ExpressionWithAlias,QualifiedWildcard,Wildcard};
 use csv::{Reader,ReaderBuilder,Writer,WriterBuilder,StringRecord};
 use regex::Regex;
 use approx::abs_diff_eq;
@@ -31,6 +32,24 @@ impl error::Error for NotImplError {
   }
 }
 impl fmt::Display for NotImplError {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "{}", self.description())
+  }
+}
+
+#[derive(Debug, Clone)]
+struct NotImplReasonError {
+  err:String
+}
+impl error::Error for NotImplReasonError {
+  fn description(&self) -> &str {
+    &self.err
+  }
+  fn cause(&self) -> Option<&error::Error> {
+    None
+  }
+}
+impl fmt::Display for NotImplReasonError {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "{}", self.description())
   }
@@ -224,9 +243,9 @@ impl<T> GenericView for FileView<T>
 }
 
 struct SelectView {
-  projection: Vec<ASTNode>,
+  projection: Vec<SQLSelectItem>,
   relation: Box<GenericView>,
-  selection: Option<Box<ASTNode>>,
+  selection: Option<ASTNode>,
   // omitted: joins, group_by, having
   meta: ViewMetadata
 }
@@ -370,10 +389,18 @@ fn get_aggregate_fn(id:&str) -> Option<Box<AggregateFn>> {
   }
 }
 
-fn is_aggregate( proj: Vec<ASTNode> ) -> (Option<Vec<Box<AggregateFn>>>, Vec<ASTNode>) {
+fn get_node_from_select_item( item: &SQLSelectItem) -> Option<&ASTNode> {
+  match item {
+    UnnamedExpression(node) => Some(node),
+    ExpressionWithAlias(node,_) => Some(node),
+    _ => None
+  }
+}
+
+fn is_aggregate( proj: Vec<SQLSelectItem> ) -> (Option<Vec<Box<AggregateFn>>>, Vec<SQLSelectItem>) {
   let mut aggregate = true;
-  for node in proj.iter() {
-    if let SQLFunction{id, args} = node {
+  for item in proj.iter() {
+    if let Some(SQLFunction{id, args}) = get_node_from_select_item(item) {
       match function_type(id) {
         FnType::Scalar => aggregate = false,
         FnType::Aggregate => {
@@ -390,14 +417,24 @@ fn is_aggregate( proj: Vec<ASTNode> ) -> (Option<Vec<Box<AggregateFn>>>, Vec<AST
     return (None, proj);
   } else {
     let mut fns:Vec<Box<AggregateFn>> = Vec::new();
-    let mut retproj:Vec<ASTNode> = Vec::new();
-    for node in proj {
-      if let SQLFunction{id, mut args} = node {
-        //always matches assuming get_aggregate_fn and function_type are in sync
-        if let Some(agg) = get_aggregate_fn(&id) {
-          fns.push(agg);
-          retproj.push(args.remove(0));
-        }
+    let mut retproj:Vec<SQLSelectItem> = Vec::new();
+    for item in proj {
+      // Always matches assuming get_aggregate_fn and function_type are in sync
+      // TODO: Aggregates are super hacky
+      match item {
+        UnnamedExpression(SQLFunction{id, mut args}) => {
+          if let Some(agg) = get_aggregate_fn(&id) {
+            fns.push(agg);
+            retproj.push(UnnamedExpression(args.remove(0)));
+          }
+        },
+        ExpressionWithAlias(SQLFunction{id, mut args}, alias) => {
+          if let Some(agg) = get_aggregate_fn(&id) {
+            fns.push(agg);
+            retproj.push(ExpressionWithAlias(args.remove(0), alias));
+          }
+        },
+        _ => panic!("Unreachable")
       }
     }
     return (Some(fns), retproj)
@@ -410,33 +447,52 @@ fn make_sql_err( node : Option<&ASTNode>, msg : &str ) -> Box<SqlError> {
   })
 }
 
-fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions, stdin_available: &mut bool) -> Result<Box<GenericView>, Box<Error>> {
+fn not_impl( msg : &str ) -> Box<NotImplReasonError> {
+  Box::new(NotImplReasonError{
+    err: format!("Not implemented: {:?}", msg)
+  })
+}
+
+fn make_object_view(node: SQLObjectName, srcs: &HashMap<String,String>, opts: &CSVOptions) -> Result<Box<GenericView>, Box<Error>> {
+  match srcs.get::<str>( &node.to_string() ) {
+    Some (path) => make_file_view(path, opts),
+    None => Err(make_sql_err(None, &format!("Not a valid table: {}", &node.to_string())))
+  }
+}
+
+fn make_statement_view(node: SQLStatement, srcs: &HashMap<String,String>, opts: &CSVOptions, stdin_available: &mut bool) -> Result<Box<GenericView>, Box<Error>> {
   match node {
-    SQLIdentifier(ref table) => {
-      match srcs.get::<str>( &table ) {
-        Some (path) => make_file_view(path, opts),
-        None => Err(make_sql_err(Some(&node), &format!("Not a valid table: {}", &table)))
-      }
-    },
-    SQLSelect{ projection, relation, joins:_, selection, order_by, group_by:_, having:_, limit } => {
-      let mut src = match relation {
-        Some(source) => make_sql_view(*source, srcs, opts, stdin_available)?,
+    SQLStatement::SQLSelect( query ) => make_query_view(query, srcs, opts, stdin_available),
+    _ => Err(not_impl("Only SELECT statements supported"))
+  }
+}
+
+fn make_query_view(node: SQLQuery, srcs: &HashMap<String,String>, opts: &CSVOptions, stdin_available: &mut bool) -> Result<Box<GenericView>, Box<Error>> {
+  let SQLQuery{ ctes:_, body, order_by, limit } = node;
+  match body {
+    SQLSetExpr::Select(select) => {
+      //let { projection, relation, joins:_, selection, group_by:_, having:_} = select;
+      let mut src = match select.relation {
+        Some(TableFactor::Table {name, alias:_}) => make_object_view(name, srcs, opts)?,
+        Some(TableFactor::Derived {subquery, alias:_}) => make_query_view(*subquery, srcs, opts, stdin_available)?,
         None => make_stdin_view(stdin_available, opts)?
       };
       let headers;
-      match projection.as_slice() {
+      match select.projection.as_slice() {
         [] => return Err(make_sql_err(None, "Must specify at least one field to select")),
-        [SQLWildcard] => {
+        [Wildcard] => {
           headers = src.headers().clone();
         },
         _ => {
           let mut hdr = StringRecord::new();
-          for (i, proj) in projection.iter().enumerate() {
-            if let SQLIdentifier(id) = proj {
-              hdr.push_field(id);
-            } else {
-              hdr.push_field(&format!("Field{}", i));
-            }
+          for (i, proj) in select.projection.iter().enumerate() {
+            match proj {
+              UnnamedExpression(SQLIdentifier(id)) => hdr.push_field(id),
+              UnnamedExpression(_) => hdr.push_field(&format!("Field{}", i)),
+              ExpressionWithAlias(_, id) => hdr.push_field(id),
+              QualifiedWildcard(_) => return Err(not_impl("Qualified wildcards")),
+              Wildcard => return Err(not_impl("Wildcards within projection"))
+            };
           }
           headers = Some(hdr);
         }
@@ -448,7 +504,7 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
           _ => return Err(make_sql_err(Some(&limnode),"LIMIT must evaluate to int"))
         }
       };
-      let (aggregate, proj) = is_aggregate(projection);
+      let (aggregate, proj) = is_aggregate(select.projection);
       let view = match order_by {
         None => src,
         Some(order_expr) => {
@@ -468,7 +524,7 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
       let view: Box<GenericView> = Box::new(SelectView{
         projection: proj,
         relation: view,
-        selection: selection,
+        selection: select.selection,
         meta: ViewMetadata {
           line: 0,
           header_lookup: make_lookup(&headers),
@@ -504,8 +560,8 @@ fn make_sql_view(node: ASTNode, srcs: &HashMap<String,String>, opts: &CSVOptions
         }
       };
       Ok(view)
-    }
-    _ => Err(Box::new(NotImplError))
+    },
+    _ => Err(not_impl("Only basic SELECT supported"))
   }
 }
 
@@ -722,10 +778,10 @@ fn eval_node(node: &ASTNode, row: Option<&TableRow>, src: Option<&GenericView>) 
       let args:Result<Vec<CSVCell>,_> = args.into_iter().map(|x| eval_node(x, row, src)).collect();
       eval_sql_function(id, args?.as_slice(), row, src)
     },
-    _ => Err(Box::new(NotImplError))
+    _ => Err(Box::new(not_impl("Node type not implemented")))
   }
 }
-fn next_where_internal(view: &mut GenericView, sel: &Box<ASTNode>) -> Result<Option<TableRow>,Box<Error>> {
+fn next_where_internal(view: &mut GenericView, sel: &ASTNode) -> Result<Option<TableRow>,Box<Error>> {
   loop {
     match view.next()? {
       Some(row) => {
@@ -741,7 +797,7 @@ fn next_where_internal(view: &mut GenericView, sel: &Box<ASTNode>) -> Result<Opt
   }
 }
 
-fn next_where(view: &mut GenericView, sel: &Option<Box<ASTNode>>) -> Result<Option<TableRow>,Box<Error>>{
+fn next_where(view: &mut GenericView, sel: &Option<ASTNode>) -> Result<Option<TableRow>,Box<Error>>{
   match sel {
     Some(node) => next_where_internal(view, node),
     None => view.next()
@@ -755,11 +811,14 @@ impl GenericView for SelectView {
       Some(src_row) => {
         self.meta.line += 1;
         match self.projection.as_slice() {
-          [SQLWildcard] => Ok(Some(src_row)),
+          [Wildcard] => Ok(Some(src_row)),
           _ => {
             let mut vec = Vec::new();
-            for node in self.projection.iter() {
-              vec.push(eval_node(&node, Some(&src_row), Some(&*self.relation))?);
+            for item in self.projection.iter() {
+              match get_node_from_select_item(item) {
+                Some(node) => vec.push(eval_node(&node, Some(&src_row), Some(&*self.relation))?),
+                None => return Err(make_sql_err(None,"Wildcard not supported in select unless it is the only expression"))
+              }
             }
             Ok(Some(TableRow{
               data: vec
@@ -864,10 +923,10 @@ impl GenericView for SortedView {
           };
           let ord = compare_cells(&lval, &rval);
           if ord != Ordering::Equal {
-            if node.asc {
-              return ord;
-            } else {
+            if let Some(false) = node.asc {
               return ord.reverse();
+            } else {
+              return ord;
             }
           }
         }
@@ -988,12 +1047,14 @@ fn do_main() -> Result<(), Box<Error>>{
 
     eprintln!("Opts: {:?}", opts);
     eprintln!("Tables: {:?}", &table_lookup);
-    let mut stdin_available = true;
-    let mut sql_view = make_sql_view( ast, &table_lookup, &opts, &mut stdin_available )?;
-    let mut wtr = WriterBuilder::new()
-      .delimiter(opts.delimiter)
-      .has_headers(false)
-      .from_writer(std::io::stdout());
-    write_view(&mut *sql_view, &mut wtr)?;
+    for statement in ast {
+      let mut stdin_available = true;
+      let mut sql_view = make_statement_view( statement, &table_lookup, &opts, &mut stdin_available )?;
+      let mut wtr = WriterBuilder::new()
+        .delimiter(opts.delimiter)
+        .has_headers(false)
+        .from_writer(std::io::stdout());
+      write_view(&mut *sql_view, &mut wtr)?;
+    }
     Ok(())
 }
